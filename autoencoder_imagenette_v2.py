@@ -239,11 +239,13 @@ def train_autoencoder(
     epochs_no_improve = 0
     best_model = None
 
+    global_step = 0  # Initialize global step counter
+
     for epoch in range(num_epochs):
         # Training Phase
         autoencoder.train()
         train_loss = 0.0
-        for images, _ in train_loader:
+        for batch_idx, (images, _) in enumerate(train_loader):
             images = images.to(device)
             optimizer.zero_grad()
             outputs = autoencoder(images)
@@ -256,7 +258,9 @@ def train_autoencoder(
             train_loss += loss.item()
 
             if wandb_run:
-                wandb_run.log({"train_loss": loss.item()})
+                wandb_run.log({"train_loss": loss.item()}, step=global_step)
+
+            global_step += 1  # Increment global step
 
         avg_train_loss = train_loss / len(train_loader)
 
@@ -270,9 +274,6 @@ def train_autoencoder(
                 loss = criterion(outputs, images)
                 val_loss += loss.item()
 
-                if wandb_run:
-                    wandb_run.log({"val_loss": loss.item()})
-
         avg_val_loss = val_loss / len(val_loader)
 
         print(
@@ -285,7 +286,8 @@ def train_autoencoder(
                     "epoch": epoch + 1,
                     "avg_train_loss": avg_train_loss,
                     "avg_val_loss": avg_val_loss,
-                }
+                },
+                step=global_step,
             )
 
         # Visualize reconstructions every 'reconstruction_interval' epochs
