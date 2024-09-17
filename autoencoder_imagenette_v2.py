@@ -12,6 +12,7 @@ from torchvision import datasets, transforms, utils as vutils
 from typing import Optional, Tuple, Any
 import wandb
 import io
+from PIL import Image
 
 
 # ----------------------------
@@ -402,9 +403,12 @@ def visualize_reconstructions(
     plt.savefig(buf, format="png")
     buf.seek(0)
 
+    # Open as PIL Image
+    pil_image = Image.open(buf)
+
     # Log the plot to wandb
     if wandb_run is not None:
-        wandb_run.log({"reconstructions": wandb.Image(buf)})
+        wandb_run.log({"reconstructions": wandb.Image(pil_image)})
 
     plt.close(fig)  # Close the figure to free up memory
 
@@ -423,7 +427,17 @@ if __name__ == "__main__":
     batch_size = 64
     num_epochs = 100
     learning_rate = 0.001
-    latent_dims = [64, 128, 256]  # Experiment with different latent dimensions
+    latent_dims = [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+    ]  # Experiment with different latent dimensions
     patience = 10
     min_delta = 0.001
     project_name = "autoencoder_imagenettev2"
@@ -443,12 +457,20 @@ if __name__ == "__main__":
     )
 
     # ----------------------------
-    # Step 3: Initialize Results
+    # Step 3: Get fixed images for reconstruction visualization
+    # ----------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fixed_images = get_fixed_images(
+        val_loader, num_images=num_images_to_reconstruct, device=device
+    )
+
+    # ----------------------------
+    # Step 4: Initialize Results
     # ----------------------------
     results = []
 
     # ----------------------------
-    # Step 4: Train Autoencoder with Different Latent Dimensions
+    # Step 5: Train Autoencoder with Different Latent Dimensions
     # ----------------------------
     for latent_dim in latent_dims:
         print(f"\nTraining autoencoder with latent dim {latent_dim}")
@@ -478,12 +500,6 @@ if __name__ == "__main__":
                 },
             )
             wandb.watch(autoencoder)
-
-        # Get fixed images for reconstruction visualization
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        fixed_images = get_fixed_images(
-            val_loader, num_images=num_images_to_reconstruct, device=device
-        )
 
         # Train Autoencoder
         trained_model, best_val_loss = train_autoencoder(
@@ -517,7 +533,7 @@ if __name__ == "__main__":
             wandb_run.finish()
 
     # ----------------------------
-    # Step 5: Print Summary of Results
+    # Step 6: Print Summary of Results
     # ----------------------------
     print("\nTraining Summary:")
     for latent_dim, best_loss in results:
