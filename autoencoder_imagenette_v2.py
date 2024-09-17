@@ -9,8 +9,9 @@ from torch import Tensor
 from torch.optim import Adam
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, utils as vutils
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 import wandb
+import io
 
 
 # ----------------------------
@@ -133,6 +134,7 @@ def get_imagenette_dataloaders(
 class Encoder(nn.Module):
     def __init__(self, latent_dim: int = 128):
         super(Encoder, self).__init__()
+        self.latent_dim = latent_dim  # Add this line
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1),  # 32 x 160 x 160
             nn.ReLU(inplace=True),
@@ -182,6 +184,7 @@ class Decoder(nn.Module):
 class Autoencoder(nn.Module):
     def __init__(self, latent_dim: int = 128):
         super(Autoencoder, self).__init__()
+        self.latent_dim = latent_dim  # Add this line
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
 
@@ -204,9 +207,11 @@ def train_autoencoder(
     optimizer: Adam,
     criterion: nn.Module,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    wandb_run: Optional[wandb.Run] = None,
+    wandb_run: Optional[Any] = None,
     patience: int = 10,
     min_delta: float = 0.001,
+    reconstruction_interval: int = 10,
+    fixed_images: Optional[Tensor] = None,
 ) -> Tuple[nn.Module, float]:
     """
     Train the autoencoder model.
@@ -219,9 +224,11 @@ def train_autoencoder(
         optimizer (Adam): Optimizer.
         criterion (nn.Module): Loss function.
         device (torch.device): Device to train on.
-        wandb_run (Optional[wandb.Run]): WandB run object for logging.
+        wandb_run (Optional[Any]): WandB run object for logging.
         patience (int): Early stopping patience.
         min_delta (float): Minimum change to qualify as improvement.
+        reconstruction_interval (int): Interval (in epochs) to visualize reconstructions.
+        fixed_images (Optional[Tensor]): Fixed set of images for reconstruction visualization.
 
     Returns:
         Tuple[nn.Module, float]: Trained model and best validation loss.
@@ -280,6 +287,15 @@ def train_autoencoder(
                 }
             )
 
+        # Visualize reconstructions every 'reconstruction_interval' epochs
+        if (epoch + 1) % reconstruction_interval == 0 and fixed_images is not None:
+            visualize_reconstructions(
+                autoencoder,
+                fixed_images,
+                device,
+                wandb_run=wandb_run,
+            )
+
         # Early Stopping Check
         if avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
@@ -302,9 +318,9 @@ def train_autoencoder(
     if wandb_run:
         torch.save(
             autoencoder.state_dict(),
-            f"autoencoder_{autoencoder.encoder.latent_dim}.pth",
+            f"autoencoder_{autoencoder.latent_dim}.pth",
         )
-        wandb_run.save(f"autoencoder_{autoencoder.encoder.latent_dim}.pth")
+        wandb_run.save(f"autoencoder_{autoencoder.latent_dim}.pth")
 
     return autoencoder, best_val_loss
 
@@ -314,37 +330,50 @@ def train_autoencoder(
 # ----------------------------
 
 
+def get_fixed_images(
+    dataloader: DataLoader,
+    num_images: int = 8,
+    device: torch.device = torch.device("cpu"),
+) -> Tensor:
+    """
+    Get a fixed set of images from the dataloader.
+
+    Args:
+        dataloader (DataLoader): The dataloader to get images from.
+        num_images (int): Number of images to get.
+        device (torch.device): The device to put the images on.
+
+    Returns:
+        Tensor: A tensor of fixed images.
+    """
+    fixed_images = next(iter(dataloader))[0][:num_images].to(device)
+    return fixed_images
+
+
 def visualize_reconstructions(
     autoencoder: nn.Module,
-    dataloader: DataLoader,
+    fixed_images: Tensor,
     device: torch.device,
-    num_images: int = 8,
-    filename: str = "reconstructions.png",
-    wandb_run: Optional[wandb.Run] = None,
+    wandb_run: Optional[Any] = None,
 ):
     """
-    Visualize original and reconstructed images side by side and save to a file and wandb.
+    Visualize original and reconstructed images side by side and log to wandb.
 
     Args:
         autoencoder (nn.Module): Trained autoencoder model.
-        dataloader (DataLoader): DataLoader for the dataset.
+        fixed_images (Tensor): Fixed set of images to reconstruct.
         device (torch.device): Device to perform computations on.
-        num_images (int): Number of images to display.
-        filename (str): Filename to save the plot.
-        wandb_run (Optional[wandb.Run]): WandB run object for logging.
+        wandb_run (Optional[Any]): WandB run object for logging.
     """
     autoencoder.eval()
     with torch.no_grad():
-        # Get a batch of images
-        images, _ = next(iter(dataloader))
-        images = images.to(device)
-        outputs = autoencoder(images)
+        outputs = autoencoder(fixed_images)
 
     # Move images to CPU and denormalize
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-    images = images.cpu() * std + mean
+    images = fixed_images.cpu() * std + mean
     outputs = outputs.cpu() * std + mean
 
     # Clamp to [0,1]
@@ -352,14 +381,12 @@ def visualize_reconstructions(
     outputs = torch.clamp(outputs, 0, 1)
 
     # Create a grid of original images
-    grid_original = vutils.make_grid(images[:num_images], nrow=num_images, padding=2)
+    grid_original = vutils.make_grid(images, nrow=len(images), padding=2)
     # Create a grid of reconstructed images
-    grid_reconstructed = vutils.make_grid(
-        outputs[:num_images], nrow=num_images, padding=2
-    )
+    grid_reconstructed = vutils.make_grid(outputs, nrow=len(outputs), padding=2)
 
     # Plot
-    fig, axs = plt.subplots(2, 1, figsize=(num_images * 2, 4))
+    fig, axs = plt.subplots(2, 1, figsize=(len(images) * 2, 4))
     axs[0].imshow(grid_original.permute(1, 2, 0).numpy())
     axs[0].set_title("Original Images")
     axs[0].axis("off")
@@ -368,17 +395,20 @@ def visualize_reconstructions(
     axs[1].set_title("Reconstructed Images")
     axs[1].axis("off")
 
-    # Save the plot to a file
     plt.tight_layout()
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
+
+    # Save the plot to a BytesIO object
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
 
     # Log the plot to wandb
     if wandb_run is not None:
-        wandb_run.log({"reconstructions": wandb.Image(filename)})
+        wandb_run.log({"reconstructions": wandb.Image(buf)})
 
     plt.close(fig)  # Close the figure to free up memory
 
-    print(f"Reconstructions saved to {filename} and logged to wandb")
+    print("Reconstructions logged to wandb")
 
 
 # ----------------------------
@@ -398,6 +428,7 @@ if __name__ == "__main__":
     min_delta = 0.001
     project_name = "autoencoder_imagenettev2"
     run_name_template = "latent_dim_{}"
+    num_images_to_reconstruct = 8
 
     # ----------------------------
     # Step 1: Download and Extract Imagenette v2
@@ -448,6 +479,12 @@ if __name__ == "__main__":
             )
             wandb.watch(autoencoder)
 
+        # Get fixed images for reconstruction visualization
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        fixed_images = get_fixed_images(
+            val_loader, num_images=num_images_to_reconstruct, device=device
+        )
+
         # Train Autoencoder
         trained_model, best_val_loss = train_autoencoder(
             autoencoder=autoencoder,
@@ -456,10 +493,12 @@ if __name__ == "__main__":
             num_epochs=num_epochs,
             optimizer=optimizer,
             criterion=criterion,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            device=device,
             wandb_run=wandb_run,
             patience=patience,
             min_delta=min_delta,
+            reconstruction_interval=10,
+            fixed_images=fixed_images,
         )
 
         # Store Results
@@ -468,10 +507,8 @@ if __name__ == "__main__":
         # Visualize Reconstructions
         visualize_reconstructions(
             trained_model,
-            val_loader,
-            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            num_images=8,
-            filename=f"reconstructions_{latent_dim}.png",
+            fixed_images,
+            device,
             wandb_run=wandb_run,
         )
 

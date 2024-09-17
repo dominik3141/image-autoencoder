@@ -10,42 +10,40 @@ import torch
 import wandb
 from typing import Optional
 
+# IMPORTANT!!!
+# This code does not work. It loads about 30GB of data into memory.
+
 
 class CowImageDataset(Dataset):
     def __init__(self, db_path: str = "cow_images.db", transform=None):
-        self.db_path = db_path
         self.transform = transform or transforms.ToTensor()
-        self.image_ids = self._load_all_image_ids()
+        self.images = self._load_all_images(db_path)
 
-    def _load_all_image_ids(self):
-        conn = sqlite3.connect(self.db_path)
+    def _load_all_images(self, db_path):
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM CowImages")
-        ids = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT image FROM CowImages")
+        images = []
+        for row in cursor.fetchall():
+            img = Image.open(io.BytesIO(row[0])).convert("RGB")
+            img_tensor = self.transform(img)
+            images.append(img_tensor)
         conn.close()
-        return ids
+        return torch.stack(images)  # Stack all images into a single tensor
 
     def __len__(self):
-        return len(self.image_ids)
+        return self.images.size(0)
 
     def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        conn = sqlite3.connect(self.db_path)
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT image FROM CowImages WHERE id = ?", (img_id,))
-            img_data = cursor.fetchone()[0]
-        finally:
-            conn.close()
-
-        img = Image.open(io.BytesIO(img_data)).convert("RGB")
-        img_tensor = self.transform(img)
-
-        return img_tensor
+        return self.images[idx]
 
 
 def get_cow_image_dataloaders(
-    db_path: str, batch_size: int, train_ratio: float = 0.8, shuffle: bool = True
+    db_path: str,
+    batch_size: int,
+    train_ratio: float = 0.8,
+    shuffle: bool = True,
+    num_workers: int = 4,  # Adjust based on your CPU cores
 ) -> tuple[DataLoader, DataLoader]:
     """
     Create DataLoaders for training and validation sets.
@@ -55,6 +53,7 @@ def get_cow_image_dataloaders(
         batch_size (int): Number of images per batch.
         train_ratio (float): Ratio of data to use for training (0.0 to 1.0).
         shuffle (bool): Whether to shuffle the data.
+        num_workers (int): Number of subprocesses for data loading.
 
     Returns:
         tuple[DataLoader, DataLoader]: Training and validation DataLoaders.
@@ -66,8 +65,20 @@ def get_cow_image_dataloaders(
 
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+    )
 
     return train_loader, val_loader
 
@@ -152,19 +163,18 @@ def train_autoencoder(
         wandb.init(project=project_name, name=run_name)
         wandb.watch(autoencoder)
 
-        # save the model architecture
-        wandb.config.update({"model_architecture": autoencoder})
+        # Save the model architecture
+        wandb.config.update({"model_architecture": str(autoencoder)})
 
-        # save the latent space dimensionality
+        # Save the latent space dimensionality
         wandb.config.update({"latent_dim": latent_dim})
 
-        # log other hyperparameters
+        # Log other hyperparameters
         wandb.config.update({"num_epochs": num_epochs})
         wandb.config.update({"learning_rate": optimizer.param_groups[0]["lr"]})
         wandb.config.update({"batch_size": train_loader.batch_size})
 
     autoencoder.to(device)
-    autoencoder.train()
     best_val_loss = float("inf")
     epochs_no_improve = 0
     best_model = None
@@ -242,10 +252,10 @@ def train_autoencoder(
         autoencoder.load_state_dict(best_model)
 
     if project_name:
-        # save the best model weights
+        # Save the best model weights
         torch.save(autoencoder.state_dict(), f"autoencoder_{latent_dim}.pth")
 
-        # save the model to wandb
+        # Save the model to wandb
         wandb.save(f"autoencoder_{latent_dim}.pth")
 
         wandb.finish()
@@ -257,7 +267,7 @@ if __name__ == "__main__":
     # HYPERPARAMETERS
     db_path = "cow_images.db"
     batch_size = 32
-    num_epochs = 100  # Increase this, as early stopping will prevent unnecessary epochs
+    num_epochs = 25  # Early stopping will prevent unnecessary epochs
     learning_rate = 0.001
     latent_dims = [16, 32, 64, 128, 256, 512]
     patience = 10
@@ -268,7 +278,9 @@ if __name__ == "__main__":
     for latent_dim in latent_dims:
         print(f"Training autoencoder with latent dim {latent_dim}")
 
-        train_loader, val_loader = get_cow_image_dataloaders(db_path, batch_size)
+        train_loader, val_loader = get_cow_image_dataloaders(
+            db_path, batch_size, num_workers=4
+        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         autoencoder = Autoencoder(latent_dim).to(device)
         optimizer = torch.optim.Adam(autoencoder.parameters(), lr=learning_rate)
