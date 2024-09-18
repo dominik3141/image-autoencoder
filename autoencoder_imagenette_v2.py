@@ -185,9 +185,10 @@ class Decoder(nn.Module):
 class Autoencoder(nn.Module):
     def __init__(self, latent_dim: int = 128):
         super(Autoencoder, self).__init__()
-        self.latent_dim = latent_dim  # Add this line
+        self.latent_dim = latent_dim
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
+        self.global_step = 0  # Add this line
 
     def forward(self, x: Tensor) -> Tensor:
         latent = self.encoder(x)
@@ -239,7 +240,7 @@ def train_autoencoder(
     epochs_no_improve = 0
     best_model = None
 
-    global_step = 0  # Initialize global step counter
+    global_step = 0
 
     for epoch in range(num_epochs):
         # Training Phase
@@ -251,7 +252,6 @@ def train_autoencoder(
             outputs = autoencoder(images)
             loss = criterion(outputs, images)
             loss.backward()
-            # Optional: Gradient Clipping
             torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -260,7 +260,7 @@ def train_autoencoder(
             if wandb_run:
                 wandb_run.log({"train_loss": loss.item()}, step=global_step)
 
-            global_step += 1  # Increment global step
+            global_step += 1
 
         avg_train_loss = train_loss / len(train_loader)
 
@@ -280,24 +280,24 @@ def train_autoencoder(
             f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}"
         )
 
+        # Log epoch-level metrics and reconstructions
         if wandb_run:
-            wandb_run.log(
-                {
-                    "epoch": epoch + 1,
-                    "avg_train_loss": avg_train_loss,
-                    "avg_val_loss": avg_val_loss,
-                },
-                step=global_step,
-            )
+            log_dict = {
+                "epoch": epoch + 1,
+                "avg_train_loss": avg_train_loss,
+                "avg_val_loss": avg_val_loss,
+            }
 
-        # Visualize reconstructions every 'reconstruction_interval' epochs
-        if (epoch + 1) % reconstruction_interval == 0 and fixed_images is not None:
-            visualize_reconstructions(
-                autoencoder,
-                fixed_images,
-                device,
-                wandb_run=wandb_run,
-            )
+            # Visualize reconstructions every 'reconstruction_interval' epochs
+            if (epoch + 1) % reconstruction_interval == 0 and fixed_images is not None:
+                reconstruction_image = visualize_reconstructions(
+                    autoencoder,
+                    fixed_images,
+                    device,
+                )
+                log_dict["reconstructions"] = wandb.Image(reconstruction_image)
+
+            wandb_run.log(log_dict, step=global_step)
 
         # Early Stopping Check
         if avg_val_loss < best_val_loss - min_delta:
@@ -316,6 +316,9 @@ def train_autoencoder(
     # Load Best Model
     if best_model is not None:
         autoencoder.load_state_dict(best_model)
+
+    # Update the global_step of the model
+    autoencoder.global_step = global_step
 
     # Save Model (Optional)
     if wandb_run:
@@ -357,17 +360,20 @@ def visualize_reconstructions(
     autoencoder: nn.Module,
     fixed_images: Tensor,
     device: torch.device,
-    wandb_run: Optional[Any] = None,
-):
+) -> Image.Image:
     """
-    Visualize original and reconstructed images side by side and log to wandb.
+    Visualize original and reconstructed images side by side and return as PIL Image.
 
     Args:
         autoencoder (nn.Module): Trained autoencoder model.
         fixed_images (Tensor): Fixed set of images to reconstruct.
         device (torch.device): Device to perform computations on.
-        wandb_run (Optional[Any]): WandB run object for logging.
+
+    Returns:
+        Image.Image: PIL Image of the visualization.
     """
+    print("Visualizing reconstructions...")
+
     autoencoder.eval()
     with torch.no_grad():
         outputs = autoencoder(fixed_images)
@@ -408,13 +414,9 @@ def visualize_reconstructions(
     # Open as PIL Image
     pil_image = Image.open(buf)
 
-    # Log the plot to wandb
-    if wandb_run is not None:
-        wandb_run.log({"reconstructions": wandb.Image(pil_image)})
-
     plt.close(fig)  # Close the figure to free up memory
 
-    print("Reconstructions logged to wandb")
+    return pil_image
 
 
 # ----------------------------
@@ -522,13 +524,17 @@ if __name__ == "__main__":
         # Store Results
         results.append((latent_dim, best_val_loss))
 
-        # Visualize Reconstructions
-        visualize_reconstructions(
-            trained_model,
-            fixed_images,
-            device,
-            wandb_run=wandb_run,
-        )
+        # Visualize and log final reconstructions
+        if fixed_images is not None and wandb_run:
+            final_reconstruction_image = visualize_reconstructions(
+                trained_model,
+                fixed_images,
+                device,
+            )
+            wandb_run.log(
+                {"final_reconstructions": wandb.Image(final_reconstruction_image)},
+                step=trained_model.global_step,  # Use the final global_step from training
+            )
 
         # Finish wandb run
         if wandb_run is not None:
