@@ -13,6 +13,7 @@ import io
 from PIL import Image
 import torchvision
 from torch import Tensor
+from torch.amp import GradScaler, autocast
 
 
 # ----------------------------
@@ -128,7 +129,7 @@ class TransformerDecoder(nn.Module):
     def _init_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         batch_size = x.size(0)
         # Add Positional Encoding
         x = x + self.pos_embed  # (B, num_patches, embed_dim)
@@ -139,28 +140,24 @@ class TransformerDecoder(nn.Module):
         x = x.transpose(0, 1)  # (B, num_patches, embed_dim)
         # Patch Reconstruction
         x = self.patch_unembed(x)  # (B, num_patches, patch_size*patch_size*channels)
-        # Reshape to image
-        x = x.view(
-            batch_size, self.num_patches, -1
-        )  # (B, num_patches, patch_size*patch_size*channels)
-        # Rearrange patches into image
-        patches_per_row = self.image_size // self.patch_size
+
+        # Reshape and rearrange patches into image using tensor operations
         channels = x.size(2) // (self.patch_size * self.patch_size)
-        reconstructed_image = torch.zeros(
-            batch_size, channels, self.image_size, self.image_size, device=x.device
+        patches_per_side = self.image_size // self.patch_size
+
+        x = x.view(
+            batch_size,
+            patches_per_side,
+            patches_per_side,
+            channels,
+            self.patch_size,
+            self.patch_size,
         )
-        for i in range(self.num_patches):
-            row = i // patches_per_row
-            col = i % patches_per_row
-            patch = x[:, i, :].view(
-                batch_size, channels, self.patch_size, self.patch_size
-            )
-            reconstructed_image[
-                :,
-                :,
-                row * self.patch_size : (row + 1) * self.patch_size,
-                col * self.patch_size : (col + 1) * self.patch_size,
-            ] = patch
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        reconstructed_image = x.view(
+            batch_size, channels, self.image_size, self.image_size
+        )
+
         return reconstructed_image
 
 
@@ -301,7 +298,12 @@ def get_imagenette_dataloaders(
     val_size = len(full_dataset) - train_size
 
     # Split the dataset
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    generator = torch.Generator().manual_seed(
+        1208
+    )  # Set a fixed seed for reproducibility
+    train_dataset, val_dataset = random_split(
+        full_dataset, [train_size, val_size], generator=generator
+    )
 
     # Create DataLoaders
     train_loader = DataLoader(
@@ -347,6 +349,7 @@ def train_autoencoder(
     best_model = None
 
     global_step = 0
+    scaler = GradScaler("cuda")  # Updated initialization
 
     for epoch in range(num_epochs):
         # Training Phase
@@ -355,11 +358,17 @@ def train_autoencoder(
         for batch_idx, (images, _) in enumerate(train_loader):
             images = images.to(device)
             optimizer.zero_grad()
-            outputs = autoencoder(images)
-            loss = criterion(outputs, images)
-            loss.backward()
+
+            # Use autocast for mixed precision
+            with autocast():
+                outputs = autoencoder(images)
+                loss = criterion(outputs, images)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
 
@@ -507,7 +516,6 @@ if __name__ == "__main__":
     in_channels = 3
     embed_dims = [64, 128, 256, 512]  # Experiment with different embedding dimensions
     depth = 6
-    num_heads = 8
     mlp_dim = 1024
     dropout = 0.1
     batch_size = 16
@@ -540,6 +548,8 @@ if __name__ == "__main__":
     # Train Autoencoder with Different Embedding Dimensions
     for embed_dim in embed_dims:
         print(f"\nTraining autoencoder with embedding dimension {embed_dim}")
+
+        num_heads = embed_dim // 8  # Set number of heads based on embedding dimension
 
         # Initialize Autoencoder
         model = TransformerAutoencoder(
@@ -576,6 +586,7 @@ if __name__ == "__main__":
                 "num_epochs": num_epochs,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
+                "precision": "mixed",
             },
         )
         wandb.watch(model)
