@@ -15,9 +15,8 @@ import torchvision
 from torch import Tensor
 from torch.amp import GradScaler, autocast
 
-
 # ----------------------------
-# Vision Transformer (ViT) Encoder
+# Vision Transformer (ViT) Encoder with CLS Token
 # ----------------------------
 
 
@@ -32,12 +31,14 @@ class ViTEncoder(nn.Module):
         num_heads: int = 12,
         mlp_dim: int = 3072,
         dropout: float = 0.1,
+        use_cls_token: bool = True,  # New parameter
     ):
         super(ViTEncoder, self).__init__()
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
         self.embed_dim = embed_dim
+        self.use_cls_token = use_cls_token
 
         # Patch Embedding
         self.patch_embed = nn.Conv2d(
@@ -47,8 +48,14 @@ class ViTEncoder(nn.Module):
             stride=patch_size,
         )  # Output: (B, embed_dim, H/patch, W/patch)
 
-        # Positional Encoding
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        # CLS Token
+        if self.use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, 1 + self.num_patches, embed_dim)
+            )
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
         # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -66,19 +73,33 @@ class ViTEncoder(nn.Module):
 
     def _init_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        if self.use_cls_token:
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
         # Patch Embedding
         x = self.patch_embed(x)  # (B, embed_dim, H/patch, W/patch)
         x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, E)
+            x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + num_patches, E)
+
         # Add Positional Encoding
-        x = x + self.pos_embed  # (B, num_patches, embed_dim)
+        x = x + self.pos_embed  # (B, 1 + num_patches, E) or (B, num_patches, E)
+
         # Transformer expects (S, B, E)
-        x = x.transpose(0, 1)  # (num_patches, B, embed_dim)
+        x = x.transpose(0, 1)  # (S, B, E)
+
         # Transformer Encoder
-        x = self.transformer_encoder(x)  # (num_patches, B, embed_dim)
-        x = x.transpose(0, 1)  # (B, num_patches, embed_dim)
-        return x  # Latent representation
+        x = self.transformer_encoder(x)  # (S, B, E)
+
+        x = x.transpose(0, 1)  # (B, S, E)
+
+        if self.use_cls_token:
+            cls_embedding = x[:, 0]  # (B, E)
+            return cls_embedding  # Global latent representation
+        return x  # (B, num_patches, E)
 
 
 # ----------------------------
@@ -97,25 +118,30 @@ class TransformerDecoder(nn.Module):
         mlp_dim: int = 3072,
         dropout: float = 0.1,
         output_channels: int = 3,
+        latent_dim: int = 768,  # New parameter
     ):
         super(TransformerDecoder, self).__init__()
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
         self.embed_dim = embed_dim
+        self.latent_dim = latent_dim
 
-        # Positional Encoding
+        # Project latent vector to embed_dim
+        self.latent_proj = nn.Linear(latent_dim, embed_dim)
+
+        # Positional Encoding for patches
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
         # Transformer Decoder Layers
-        decoder_layer = nn.TransformerEncoderLayer(
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=mlp_dim,
             dropout=dropout,
             activation="gelu",
         )
-        self.transformer_decoder = nn.TransformerEncoder(
+        self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=depth
         )
 
@@ -129,17 +155,30 @@ class TransformerDecoder(nn.Module):
     def _init_weights(self):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    def forward(self, x: Tensor) -> Tensor:
-        batch_size = x.size(0)
+    def forward(self, latent: Tensor) -> Tensor:
+        batch_size = latent.size(0)
+
+        # Project latent vector to embed_dim
+        latent = self.latent_proj(latent)  # (B, E)
+
+        # Expand latent to match number of patches (as memory for decoder)
+        memory = latent.unsqueeze(1).repeat(
+            1, self.num_patches, 1
+        )  # (B, num_patches, E)
+
         # Add Positional Encoding
-        x = x + self.pos_embed  # (B, num_patches, embed_dim)
-        # Transformer expects (S, B, E)
-        x = x.transpose(0, 1)  # (num_patches, B, embed_dim)
+        target = torch.zeros(
+            self.num_patches, batch_size, self.embed_dim, device=latent.device
+        )  # (S, B, E)
+        target = target + self.pos_embed.transpose(0, 1)  # (S, B, E)
+
         # Transformer Decoder
-        x = self.transformer_decoder(x)  # (num_patches, B, embed_dim)
-        x = x.transpose(0, 1)  # (B, num_patches, embed_dim)
+        x = self.transformer_decoder(target, memory.transpose(0, 1))  # (S, B, E)
+
+        x = x.transpose(0, 1)  # (B, S, E)
+
         # Patch Reconstruction
-        x = self.patch_unembed(x)  # (B, num_patches, patch_size*patch_size*channels)
+        x = self.patch_unembed(x)  # (B, S, patch_size*patch_size*channels)
 
         # Reshape and rearrange patches into image using tensor operations
         channels = x.size(2) // (self.patch_size * self.patch_size)
@@ -177,6 +216,8 @@ class TransformerAutoencoder(nn.Module):
         num_heads: int = 12,
         mlp_dim: int = 3072,
         dropout: float = 0.1,
+        use_cls_token: bool = True,  # New parameter
+        latent_dim: int = 768,  # New parameter
     ):
         super(TransformerAutoencoder, self).__init__()
         self.encoder = ViTEncoder(
@@ -188,6 +229,7 @@ class TransformerAutoencoder(nn.Module):
             num_heads=num_heads,
             mlp_dim=mlp_dim,
             dropout=dropout,
+            use_cls_token=use_cls_token,
         )
         self.decoder = TransformerDecoder(
             image_size=image_size,
@@ -198,12 +240,13 @@ class TransformerAutoencoder(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
             output_channels=in_channels,
+            latent_dim=latent_dim,
         )
-        self.global_step = 0  # Add this line
+        self.global_step = 0  # Tracking training steps
 
     def forward(self, x):
-        latent = self.encoder(x)
-        reconstructed = self.decoder(latent)
+        latent = self.encoder(x)  # (B, latent_dim)
+        reconstructed = self.decoder(latent)  # (B, C, H, W)
         return reconstructed
 
 
@@ -278,10 +321,12 @@ def get_imagenette_dataloaders(
     Returns:
         Tuple[DataLoader, DataLoader]: Training and validation DataLoaders.
     """
-    # Define transformations
+    # Define transformations with data augmentation
     transform = transforms.Compose(
         [
             transforms.Resize((320, 320)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],  # Standard ImageNet means
@@ -349,7 +394,7 @@ def train_autoencoder(
     best_model = None
 
     global_step = 0
-    scaler = GradScaler()  # Remove 'cuda' argument
+    scaler = GradScaler()  # For mixed precision
 
     for epoch in range(num_epochs):
         # Training Phase
@@ -360,7 +405,7 @@ def train_autoencoder(
             optimizer.zero_grad()
 
             # Use autocast for mixed precision
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+            with autocast(device_type=device.type):
                 outputs = autoencoder(images)
                 loss = criterion(outputs, images)
 
@@ -552,11 +597,23 @@ if __name__ == "__main__":
     # Initialize Results
     results = []
 
+    # Function to determine a suitable number of heads based on embed_dim
+    def get_num_heads(embed_dim):
+        if embed_dim % 16 == 0 and embed_dim // 16 >= 4:
+            return 16
+        elif embed_dim % 8 == 0 and embed_dim // 8 >= 4:
+            return 8
+        elif embed_dim % 4 == 0 and embed_dim // 4 >= 4:
+            return 4
+        else:
+            return 1  # Fallback
+
     # Train Autoencoder with Different Embedding Dimensions
     for embed_dim in embed_dims:
         print(f"\nTraining autoencoder with embedding dimension {embed_dim}")
 
-        num_heads = embed_dim // 8  # Set number of heads based on embedding dimension
+        num_heads = get_num_heads(embed_dim)  # Determine suitable number of heads
+        latent_dim = embed_dim  # Assuming latent_dim equals embed_dim
 
         # Initialize Autoencoder
         model = TransformerAutoencoder(
@@ -568,6 +625,8 @@ if __name__ == "__main__":
             num_heads=num_heads,
             mlp_dim=mlp_dim,
             dropout=dropout,
+            use_cls_token=True,  # Enable global latent vector (should never be disabled)
+            latent_dim=latent_dim,
         )
 
         # Define Optimizer and Loss
@@ -595,8 +654,9 @@ if __name__ == "__main__":
                 "batch_size": batch_size,
                 "precision": "mixed",
             },
+            reinit=True,  # Allow multiple runs in the same script
         )
-        wandb.watch(model)
+        wandb.watch(model, log="all")
 
         # Train Autoencoder
         trained_model, best_val_loss = train_autoencoder(
@@ -610,7 +670,7 @@ if __name__ == "__main__":
             wandb_run=wandb_run,
             patience=patience,
             min_delta=min_delta,
-            reconstruction_interval=10,
+            reconstruction_interval=5,
             fixed_images=fixed_images,
         )
 
