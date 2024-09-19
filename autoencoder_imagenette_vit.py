@@ -349,7 +349,7 @@ def train_autoencoder(
     best_model = None
 
     global_step = 0
-    scaler = GradScaler("cuda")  # Updated initialization
+    scaler = GradScaler()  # Remove 'cuda' argument
 
     for epoch in range(num_epochs):
         # Training Phase
@@ -360,7 +360,7 @@ def train_autoencoder(
             optimizer.zero_grad()
 
             # Use autocast for mixed precision
-            with autocast():
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
                 outputs = autoencoder(images)
                 loss = criterion(outputs, images)
 
@@ -514,7 +514,14 @@ if __name__ == "__main__":
     image_size = 320
     patch_size = 16
     in_channels = 3
-    embed_dims = [64, 128, 256, 512]  # Experiment with different embedding dimensions
+    embed_dims = [
+        64,
+        128,
+        256,
+        512,
+        768,
+        1024,
+    ]  # Experiment with different embedding dimensions
     depth = 6
     mlp_dim = 1024
     dropout = 0.1
