@@ -4,7 +4,7 @@ import urllib.request
 from tqdm import tqdm
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 from typing import Tuple, Optional, Any
@@ -13,7 +13,10 @@ import io
 from PIL import Image
 import torchvision
 from torch import Tensor
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import OneCycleLR
+import math
+import gc
 
 # ----------------------------
 # Vision Transformer (ViT) Encoder with CLS Token
@@ -31,14 +34,12 @@ class ViTEncoder(nn.Module):
         num_heads: int = 12,
         mlp_dim: int = 3072,
         dropout: float = 0.1,
-        use_cls_token: bool = True,  # New parameter
     ):
         super(ViTEncoder, self).__init__()
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
         self.embed_dim = embed_dim
-        self.use_cls_token = use_cls_token
 
         # Patch Embedding
         self.patch_embed = nn.Conv2d(
@@ -46,16 +47,11 @@ class ViTEncoder(nn.Module):
             embed_dim,
             kernel_size=patch_size,
             stride=patch_size,
-        )  # Output: (B, embed_dim, H/patch, W/patch)
+        )
 
-        # CLS Token
-        if self.use_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-            self.pos_embed = nn.Parameter(
-                torch.zeros(1, 1 + self.num_patches, embed_dim)
-            )
-        else:
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        # CLS Token and Positional Embedding are both learned parameters (initialized to 0)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.num_patches, embed_dim))
 
         # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -63,30 +59,23 @@ class ViTEncoder(nn.Module):
             nhead=num_heads,
             dim_feedforward=mlp_dim,
             dropout=dropout,
-            activation="gelu",
+            activation="relu",
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=depth
         )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        if self.use_cls_token:
-            nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
         # Patch Embedding
         x = self.patch_embed(x)  # (B, embed_dim, H/patch, W/patch)
         x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
 
-        if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, E)
-            x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + num_patches, E)
+        # add a cls token to the beginning of the sequence
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, E)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + num_patches, E)
 
         # Add Positional Encoding
-        x = x + self.pos_embed  # (B, 1 + num_patches, E) or (B, num_patches, E)
+        x = x + self.pos_embed  # (B, 1 + num_patches, E)
 
         # Transformer expects (S, B, E)
         x = x.transpose(0, 1)  # (S, B, E)
@@ -96,10 +85,8 @@ class ViTEncoder(nn.Module):
 
         x = x.transpose(0, 1)  # (B, S, E)
 
-        if self.use_cls_token:
-            cls_embedding = x[:, 0]  # (B, E)
-            return cls_embedding  # Global latent representation
-        return x  # (B, num_patches, E)
+        cls_embedding = x[:, 0]  # (B, E) # we only return the cls embedding
+        return cls_embedding
 
 
 # ----------------------------
@@ -118,7 +105,7 @@ class TransformerDecoder(nn.Module):
         mlp_dim: int = 3072,
         dropout: float = 0.1,
         output_channels: int = 3,
-        latent_dim: int = 768,  # New parameter
+        latent_dim: int = 768,
     ):
         super(TransformerDecoder, self).__init__()
         self.image_size = image_size
@@ -127,8 +114,7 @@ class TransformerDecoder(nn.Module):
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
 
-        # Project latent vector to embed_dim
-        self.latent_proj = nn.Linear(latent_dim, embed_dim)
+        assert latent_dim == embed_dim, "Latent dimension must be equal to embed_dim"
 
         # Positional Encoding for patches
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
@@ -139,7 +125,7 @@ class TransformerDecoder(nn.Module):
             nhead=num_heads,
             dim_feedforward=mlp_dim,
             dropout=dropout,
-            activation="gelu",
+            activation="relu",
         )
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=depth
@@ -150,16 +136,13 @@ class TransformerDecoder(nn.Module):
             embed_dim, patch_size * patch_size * output_channels
         )
 
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
     def forward(self, latent: Tensor) -> Tensor:
         batch_size = latent.size(0)
 
-        # Project latent vector to embed_dim
-        latent = self.latent_proj(latent)  # (B, E)
+        assert latent.shape == (
+            batch_size,
+            self.latent_dim,
+        ), f"Latent shape must be (B, {self.latent_dim}), got {latent.shape}"
 
         # Expand latent to match number of patches (as memory for decoder)
         memory = latent.unsqueeze(1).repeat(
@@ -216,8 +199,7 @@ class TransformerAutoencoder(nn.Module):
         num_heads: int = 12,
         mlp_dim: int = 3072,
         dropout: float = 0.1,
-        use_cls_token: bool = True,  # New parameter
-        latent_dim: int = 768,  # New parameter
+        latent_dim: int = 768,
     ):
         super(TransformerAutoencoder, self).__init__()
         self.encoder = ViTEncoder(
@@ -229,7 +211,6 @@ class TransformerAutoencoder(nn.Module):
             num_heads=num_heads,
             mlp_dim=mlp_dim,
             dropout=dropout,
-            use_cls_token=use_cls_token,
         )
         self.decoder = TransformerDecoder(
             image_size=image_size,
@@ -242,12 +223,11 @@ class TransformerAutoencoder(nn.Module):
             output_channels=in_channels,
             latent_dim=latent_dim,
         )
-        self.global_step = 0  # Tracking training steps
 
     def forward(self, x):
-        latent = self.encoder(x)  # (B, latent_dim)
-        reconstructed = self.decoder(latent)  # (B, C, H, W)
-        return reconstructed
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
 
 
 # ----------------------------
@@ -268,6 +248,19 @@ def download_url(url: str, save_path: str):
         unit="B", unit_scale=True, miniters=1, desc=os.path.basename(save_path)
     ) as t:
         urllib.request.urlretrieve(url, filename=save_path, reporthook=t.update_to)
+
+
+def safe_extract(
+    tar: tarfile.TarFile, path: str = ".", members=None, *, numeric_owner=False
+):
+    """Safely extract tar files to prevent path traversal vulnerabilities."""
+    for member in tar.getmembers():
+        member_path = os.path.join(path, member.name)
+        if not os.path.commonpath(
+            [os.path.abspath(path), os.path.abspath(member_path)]
+        ).startswith(os.path.abspath(path)):
+            raise Exception("Attempted Path Traversal in Tar File")
+    tar.extractall(path, members, numeric_owner=numeric_owner)
 
 
 def download_and_extract_imagenette(dest_dir: str = "data/imagenette") -> str:
@@ -294,7 +287,7 @@ def download_and_extract_imagenette(dest_dir: str = "data/imagenette") -> str:
     if not os.path.exists(extract_path):
         print("Extracting Imagenette v2...")
         with tarfile.open(tgz_path, "r:gz") as tar:
-            tar.extractall(path=dest_dir)
+            safe_extract(tar, path=dest_dir)
         print("Extraction complete.")
     else:
         print("Imagenette v2 already extracted.")
@@ -308,7 +301,7 @@ def download_and_extract_imagenette(dest_dir: str = "data/imagenette") -> str:
 
 
 def get_imagenette_dataloaders(
-    data_dir: str, batch_size: int = 32, train_ratio: float = 0.8
+    data_dir: str, batch_size: int = 32
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create DataLoaders for Imagenette training and validation sets.
@@ -316,13 +309,12 @@ def get_imagenette_dataloaders(
     Args:
         data_dir (str): Directory where Imagenette is extracted.
         batch_size (int): Number of images per batch.
-        train_ratio (float): Ratio of data to use for training (0.0 to 1.0).
 
     Returns:
         Tuple[DataLoader, DataLoader]: Training and validation DataLoaders.
     """
-    # Define transformations with data augmentation
-    transform = transforms.Compose(
+    # Define transformations with data augmentation for training
+    train_transform = transforms.Compose(
         [
             transforms.Resize((320, 320)),
             transforms.RandomHorizontalFlip(),
@@ -335,19 +327,24 @@ def get_imagenette_dataloaders(
         ]
     )
 
-    # Create the full dataset
-    full_dataset = datasets.ImageFolder(root=data_dir, transform=transform)
+    # Define transformations without augmentation for validation
+    val_transform = transforms.Compose(
+        [
+            transforms.Resize((320, 320)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
 
-    # Calculate sizes
-    train_size = int(train_ratio * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-
-    # Split the dataset
-    generator = torch.Generator().manual_seed(
-        1208
-    )  # Set a fixed seed for reproducibility
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size], generator=generator
+    # Create separate datasets for training and validation
+    train_dataset = datasets.ImageFolder(
+        root=os.path.join(data_dir, "train"), transform=train_transform
+    )
+    val_dataset = datasets.ImageFolder(
+        root=os.path.join(data_dir, "val"), transform=val_transform
     )
 
     # Create DataLoaders
@@ -374,6 +371,116 @@ def get_imagenette_dataloaders(
 # ----------------------------
 
 
+def get_num_heads(embed_dim: int) -> int:
+    return max(1, embed_dim // 8)
+
+
+def get_fixed_images(
+    dataloader: DataLoader,
+    num_images: int = 8,
+    device: torch.device = torch.device("cpu"),
+) -> Tensor:
+    fixed_images = next(iter(dataloader))[0][:num_images].to(device)
+    return fixed_images
+
+
+def find_optimal_batch_size(
+    model: nn.Module,
+    train_dataset: torch.utils.data.Dataset,
+    initial_batch_size: int = 4,
+    max_batch_size: int = 512,
+) -> int:
+    """
+    Finds the largest possible batch size that fits into GPU memory.
+
+    Args:
+        model (nn.Module): The model to test.
+        train_dataset (torch.utils.data.Dataset): Training dataset.
+        initial_batch_size (int): Starting batch size for the search.
+        max_batch_size (int): Maximum batch size to try.
+
+    Returns:
+        int: Optimal batch size.
+    """
+    model.train()  # Set model to training mode
+    device = next(model.parameters()).device
+    batch_size = initial_batch_size
+
+    while batch_size <= max_batch_size:
+        try:
+            loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0)
+            inputs, _ = next(iter(loader))
+            inputs = inputs.to(device)
+
+            outputs = model.encoder(inputs)
+            reconstructed = model.decoder(outputs)
+            loss = torch.sum(reconstructed)
+            loss.backward()
+
+            batch_size *= 2
+
+            del inputs, outputs, loss
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Out of memory with batch size {batch_size}.")
+                batch_size = max(batch_size // 2, initial_batch_size)
+                print(f"Optimal batch size: {batch_size}")
+                return batch_size
+            else:
+                raise e
+
+    print(f"Reached max batch size. Optimal batch size: {batch_size}")
+    return batch_size
+
+
+def find_lr(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+) -> float:
+    """
+    Finds the optimal learning rate by increasing it exponentially and tracking loss.
+
+    Args:
+        model (nn.Module): The model to train.
+        train_loader (DataLoader): Training DataLoader.
+        optimizer (torch.optim.Optimizer): Optimizer.
+        criterion (nn.Module): Loss function.
+        device (torch.device): Device to run on.
+
+    Returns:
+        float: Optimal learning rate.
+    """
+    num_batches = 100
+    log_lrs = torch.linspace(math.log(1e-7), math.log(10), num_batches)
+    lrs = torch.exp(log_lrs)
+    losses = []
+
+    model.train()
+    for i, (batch, _) in enumerate(train_loader):
+        if i >= num_batches:
+            break
+
+        batch = batch.to(device)
+        optimizer.param_groups[0]["lr"] = lrs[i].item()
+
+        optimizer.zero_grad()
+        output = model(batch)
+        loss = criterion(output, batch)
+        loss.backward()
+        optimizer.step()
+
+        losses.append(loss.item())
+
+    best_lr = lrs[losses.index(min(losses))].item()
+    return best_lr
+
+
 def train_autoencoder(
     autoencoder: nn.Module,
     train_loader: DataLoader,
@@ -388,13 +495,47 @@ def train_autoencoder(
     reconstruction_interval: int = 10,
     fixed_images: Optional[Tensor] = None,
 ) -> Tuple[nn.Module, float]:
+    """
+    Trains the transformer autoencoder with early stopping and learning rate scheduling.
+
+    Args:
+        autoencoder (nn.Module): The transformer autoencoder model.
+        train_loader (DataLoader): Training DataLoader.
+        val_loader (DataLoader): Validation DataLoader.
+        num_epochs (int): Number of training epochs.
+        optimizer (torch.optim.Optimizer): Optimizer.
+        criterion (nn.Module): Loss function.
+        device (torch.device): Device to run on.
+        wandb_run (Optional[Any]): Weights & Biases run instance.
+        patience (int): Early stopping patience.
+        min_delta (float): Minimum change to qualify as improvement.
+        reconstruction_interval (int): Interval (in epochs) to log reconstructions.
+        fixed_images (Optional[Tensor]): Fixed images for visualization.
+
+    Returns:
+        Tuple[nn.Module, float]: Trained model and best validation loss.
+    """
     autoencoder.to(device)
+    autoencoder.train()  # Ensure model is in training mode
     best_val_loss = float("inf")
     epochs_no_improve = 0
     best_model = None
 
     global_step = 0
-    scaler = GradScaler()  # For mixed precision
+    scaler = GradScaler()
+
+    # Find the best learning rate
+    print("Finding best learning rate...")
+    best_lr = find_lr(autoencoder, train_loader, optimizer, criterion, device)
+    print(f"Best learning rate found: {best_lr}")
+
+    # Reset the optimizer with the found learning rate
+    optimizer = torch.optim.Adam(autoencoder.parameters(), lr=best_lr)
+
+    # Set up the OneCycleLR scheduler
+    scheduler = OneCycleLR(
+        optimizer, max_lr=best_lr, epochs=num_epochs, steps_per_epoch=len(train_loader)
+    )
 
     for epoch in range(num_epochs):
         # Training Phase
@@ -405,20 +546,28 @@ def train_autoencoder(
             optimizer.zero_grad()
 
             # Use autocast for mixed precision
-            with autocast(device_type=device.type):
+            with autocast():
                 outputs = autoencoder(images)
                 loss = criterion(outputs, images)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=10.0)
             scaler.step(optimizer)
             scaler.update()
+
+            scheduler.step()
 
             train_loss += loss.item()
 
             if wandb_run:
-                wandb_run.log({"train_loss": loss.item()}, step=global_step)
+                wandb_run.log(
+                    {
+                        "train_loss": loss.item(),
+                        "learning_rate": scheduler.get_last_lr()[0],
+                    },
+                    step=global_step,
+                )
 
             global_step += 1
 
@@ -475,32 +624,29 @@ def train_autoencoder(
     if best_model is not None:
         autoencoder.load_state_dict(best_model)
 
-    # Update the global_step of the model
-    autoencoder.global_step = global_step
-
     # Save Model (Optional)
     if wandb_run:
-        torch.save(
-            autoencoder.state_dict(),
-            f"transformer_autoencoder_{autoencoder.encoder.embed_dim}.pth",
-        )
-        wandb_run.save(f"transformer_autoencoder_{autoencoder.encoder.embed_dim}.pth")
+        model_path = f"transformer_autoencoder_{autoencoder.encoder.embed_dim}.pth"
+        torch.save(autoencoder.state_dict(), model_path)
+        wandb.save(model_path)
 
     return autoencoder, best_val_loss
-
-
-def get_fixed_images(
-    dataloader: DataLoader,
-    num_images: int = 8,
-    device: torch.device = torch.device("cpu"),
-) -> Tensor:
-    fixed_images = next(iter(dataloader))[0][:num_images].to(device)
-    return fixed_images
 
 
 def visualize_reconstructions(
     model: nn.Module, fixed_images: Tensor, device: torch.device
 ) -> Image.Image:
+    """
+    Generates a visualization of original and reconstructed images.
+
+    Args:
+        model (nn.Module): Trained autoencoder model.
+        fixed_images (Tensor): Fixed images for visualization.
+        device (torch.device): Device to run on.
+
+    Returns:
+        Image.Image: PIL Image containing the visualization.
+    """
     model.eval()
     with torch.no_grad():
         outputs = model(fixed_images)
@@ -550,30 +696,17 @@ def visualize_reconstructions(
     return pil_image
 
 
-# ----------------------------
-# Main Execution Block
-# ----------------------------
-
 if __name__ == "__main__":
     # Hyperparameters
     image_size = 320
     patch_size = 16
     in_channels = 3
-    embed_dims = [
-        64,
-        128,
-        256,
-        512,
-        768,
-        1024,
-    ]  # Experiment with different embedding dimensions
-    depth = 6
+    embed_dims = [64, 128, 256, 512, 768, 1024]
+    depth = 8
     mlp_dim = 1024
-    dropout = 0.1
-    batch_size = 16
+    dropout = 0.0  # no dropout for now
     num_epochs = 50
-    learning_rate = 1e-4
-    data_dir = "data/imagenette"  # Destination directory for Imagenette
+    data_dir = "data/imagenette"
     patience = 10
     min_delta = 0.001
     project_name = "transformer_autoencoder_imagenette"
@@ -583,39 +716,17 @@ if __name__ == "__main__":
     # Download and extract Imagenette v2
     extract_path = download_and_extract_imagenette(dest_dir=data_dir)
 
-    # Get DataLoaders
-    train_loader, val_loader = get_imagenette_dataloaders(
-        data_dir=extract_path, batch_size=batch_size, train_ratio=0.8
-    )
-
-    # Get fixed images for reconstruction visualization
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fixed_images = get_fixed_images(
-        val_loader, num_images=num_images_to_reconstruct, device=device
-    )
 
-    # Initialize Results
     results = []
 
-    # Function to determine a suitable number of heads based on embed_dim
-    def get_num_heads(embed_dim):
-        if embed_dim % 16 == 0 and embed_dim // 16 >= 4:
-            return 16
-        elif embed_dim % 8 == 0 and embed_dim // 8 >= 4:
-            return 8
-        elif embed_dim % 4 == 0 and embed_dim // 4 >= 4:
-            return 4
-        else:
-            return 1  # Fallback
-
-    # Train Autoencoder with Different Embedding Dimensions
     for embed_dim in embed_dims:
         print(f"\nTraining autoencoder with embedding dimension {embed_dim}")
 
-        num_heads = get_num_heads(embed_dim)  # Determine suitable number of heads
-        latent_dim = embed_dim  # Assuming latent_dim equals embed_dim
+        num_heads = get_num_heads(embed_dim)
+        latent_dim = embed_dim
 
-        # Initialize Autoencoder
+        # 1. Initialize the model
         model = TransformerAutoencoder(
             image_size=image_size,
             patch_size=patch_size,
@@ -625,18 +736,40 @@ if __name__ == "__main__":
             num_heads=num_heads,
             mlp_dim=mlp_dim,
             dropout=dropout,
-            use_cls_token=True,  # Enable global latent vector (should never be disabled)
             latent_dim=latent_dim,
+        ).to(device)
+
+        # 2. Create data loaders with temporary batch size for batch size search
+        initial_batch_size = 4
+        train_loader_temp, _ = get_imagenette_dataloaders(
+            data_dir=extract_path, batch_size=initial_batch_size
+        )
+        train_dataset_temp = train_loader_temp.dataset
+
+        # 3. Find the optimal batch size using the training dataset
+        optimal_batch_size = find_optimal_batch_size(model, train_dataset_temp)
+        print(f"Optimal batch size determined: {optimal_batch_size}")
+
+        # 4. Create data loaders with the optimal batch size
+        train_loader, val_loader = get_imagenette_dataloaders(
+            data_dir=extract_path, batch_size=optimal_batch_size
         )
 
-        # Define Optimizer and Loss
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-        criterion = nn.MSELoss()
+        # Get fixed images for reconstruction visualization
+        fixed_images = get_fixed_images(
+            val_loader, num_images=num_images_to_reconstruct, device=device
+        )
 
-        # Define Run Name
+        # 5. Initialize criterion and optimizer with a default learning rate
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1e-3
+        )  # Initial LR will be overridden
+
+        # 6. Define Run Name
         run_name = run_name_template.format(embed_dim)
 
-        # Initialize wandb run
+        # 7. Initialize wandb run
         wandb_run = wandb.init(
             project=project_name,
             name=run_name,
@@ -650,15 +783,16 @@ if __name__ == "__main__":
                 "mlp_dim": mlp_dim,
                 "dropout": dropout,
                 "num_epochs": num_epochs,
-                "learning_rate": learning_rate,
-                "batch_size": batch_size,
+                "batch_size": optimal_batch_size,
+                "initial_learning_rate": 1e-3,  # Placeholder; will be updated
                 "precision": "mixed",
+                "lr_scheduler": "OneCycleLR",
             },
-            reinit=True,  # Allow multiple runs in the same script
+            reinit=True,
         )
         wandb.watch(model, log="all")
 
-        # Train Autoencoder
+        # 8. Train Autoencoder
         trained_model, best_val_loss = train_autoencoder(
             autoencoder=model,
             train_loader=train_loader,
@@ -676,16 +810,6 @@ if __name__ == "__main__":
 
         # Store Results
         results.append((embed_dim, best_val_loss))
-
-        # Visualize and log final reconstructions
-        if fixed_images is not None:
-            final_reconstruction_image = visualize_reconstructions(
-                trained_model, fixed_images, device
-            )
-            wandb_run.log(
-                {"final_reconstructions": wandb.Image(final_reconstruction_image)},
-                step=trained_model.global_step,
-            )
 
         # Finish wandb run
         wandb_run.finish()
